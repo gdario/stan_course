@@ -2,3 +2,4 @@ figures/
 workflow_with_dplyr/
 *.rds
 *.html
+.Rproj.user

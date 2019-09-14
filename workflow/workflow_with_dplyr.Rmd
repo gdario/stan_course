@@ -23,8 +23,8 @@ library(doParallel)
 library(rstan)
 rstan_options(auto_write = TRUE)
 
-source("stan_utility.R", local = util)
 util <- new.env()
+source("stan_utility.R", local = util)
 ```
 
 ## Colors
@@ -87,7 +87,7 @@ plot_bin_quantiles <- function(simu_ys,
   quants <- apply(bin_counts, 1, quantile, probs = pbs)
   df_quants <- as_tibble(t(quants))
   names(df_quants) <- paste("q", as.character(10 * pbs), sep = "_")
-  df_quants$x <- 0:40
+  df_quants$x <- 0:B
   ## Plot the bin quantiles
   ggplot(df_quants, aes(x = x)) +
     geom_ribbon(aes(ymin = q_1, ymax = q_9), fill = c_light) +
@@ -129,6 +129,7 @@ compute_metrics <- function(simu,
 
   ## Check if there are problematic cases
   util <- new.env()
+  source("stan_utility.R", local = util)
   warning_code <- util$check_all_diagnostics(fit, quiet = TRUE)
 
   ## Simulation Based Calibration ranking
@@ -284,15 +285,13 @@ fit <- stan(file = "sample_joint_ensemble2.stan", data = simu_data,
 
 params <- extract(fit)
 
-simu_list <- list(
-  "lambda" = params$lambda,
-  "theta" = params$theta,
-  "y" = params$y
-)
+simu_lambdas <- params$lambda
+simu_thetas <- params$theta
+simu_ys <- params$y
 ```
 
 ```{r}
-plot_bin_quantiles(simu_list$y) +
+plot_bin_quantiles(simu_ys) +
   geom_vline(xintercept = 25, color = "darkgrey")
 ```
 
@@ -301,57 +300,116 @@ We can see the zero-enrichment in the prior predictive distribution, and the tai
 ## Simulated fits
 
 ```{r}
-compute_metrics2 <- function(simu, 
-                             N=N, 
-                             model, 
-                             parameters=c("lambda", "theta"),
-                             thin=8, 
-                             prior_sd_lambda=5.82337,
-                             prior_sd_theta=sqrt(1.0 / 12),
-                             seed=4938483) {
-  simu_lambda <- simu[1]
-  simu_theta <- simu[2]
-  simu_y <- simu[-c(1, 2)]
+tryCatch({
+  registerDoParallel(cores = 4)
+  simu_list <- t(data.matrix(data.frame(simu_lambdas, simu_thetas, simu_ys)))
+  fit_model <- stan_model(file = "fit_data2.stan")
+  ensemble_output <- foreach(simu = simu_list, .combine = "cbind") %dopar% {
+    
+    simu_lambda <- simu[1]
+    simu_theta <- simu[2]
+    simu_y <- simu[3:(N + 2)]
+    input_data <- list("N" = N, "y" = simu_y)
+    capture.output(library(rstan))
+    capture.output(
+      fit <- sampling(fit_model, data = input_data, seed = 4938483)
+    )
+    util <- new.env()
+    source("stan_utility.R", local = util)
+    warning_code <- util$check_all_diagnostics(fit, quiet = TRUE)
+    sbc_rank_lambda <- sum(
+      simu_lambda < extract(fit)$lambda[seq(1, 4000 - 8, 8)]
+    )
+    sbc_rank_theta <- sum(simu_theta < extract(fit)$theta[seq(1, 4000 - 8, 8)])
+    s <- summary(fit, probs = c(), pars = "lambda")$summary
+    post_mean_lambda <- s[, 1]
+    post_sd_lambda <- s[, 3]
+    prior_sd_lambda <- 5.82337
+    z_score_lambda <- (post_mean_lambda - simu_lambda) / post_sd_lambda
+    shrinkage_lambda <- 1 - (post_sd_lambda / prior_sd_lambda) ** 2
 
-  input_data <- list("N" = N, "y" = simu_y)
+    s <- summary(fit, probs = c(), pars = "theta")$summary
+    post_mean_theta <- s[, 1]
+    post_sd_theta <- s[, 3]
+    prior_sd_theta <- 5.82337
+    z_score_theta <- (post_mean_theta - simu_theta) / post_sd_theta
+    shrinkage_theta <- 1 - (post_sd_theta / prior_sd_theta) ** 2
+    
+    c(warning_code, sbc_rank_lambda, z_score_lambda, shrinkage_lambda,
+      sbc_rank_theta, z_score_theta, shrinkage_theta)
+  }
+}, finally = {stopImplicitCluster()})
+```
+Do we have warning codes? Yes we do:
 
-  capture.output(
-    fit <- sampling(model, data = input_data, seed = seed)
-  )
+```{r}
+print(sum(ensemble_output[1, ]))
+```
 
-  ## Check if there are problematic cases
-  util <- new.env()
-  warning_code <- util$check_all_diagnostics(fit, quiet = TRUE)
+What kind of warnings do we get?
 
-  ## Simulation Based Calibration ranking
-  lambda <- extract(fit)$lambda
-  theta <- extract(fit)$theta
-  
-  sbc_rank_lambda <- sum(
-    simu_lambda < lambda[seq(1, length(lambda) - thin, thin)]
-  )
-  sbc_rank_theta <- sum(simu_theta < theta[seq(1, length(theta) - thin, thin)])
-
-  s <- summary(fit, probs = c(), pars = "lambda")$summary
-  post_mean_lambda <- s[, 1]
-  post_sd_lambda <- s[, 3]
-  z_score_lambda <- (post_mean_lambda - simu_lambda) / post_sd_lambda
-  shrinkage_theta <- 1 - (post_sd_lambda / prior_sd_lambda)**2
-
-  s <- summary(fit, probs = c(), pars = "theta")$summary
-  post_mean_theta <- s[, 1]
-  post_sd_theta <- s[, 3]
-  z_score_theta <- (post_mean_theta - simu_theta) / post_sd_theta
-  shrinkage_theta <- 1 - (post_sd_theta / prior_sd_theta)**2
-  
-  c(warning_code,
-    sbc_rank_lambda, z_score_lambda, shrinkage_lambda,
-    sbc_rank_theta, z_score_theta, shrinkage_theta
-  )
+```{r what_warnings}
+warning_code <- ensemble_output[1, ]
+for (r in 1:R) {
+  if (warning_code[r] != 0) {
+    print(sprintf("Replication %s of %s", r, R))
+    util$parse_warning_code(warning_code[r])
+    print(sprintf("Simulated lambda = %s", simu_lambdas[r]))
+    print(sprintf("Simulated theta = %s", simu_thetas[r]))
+    print(" ")
+  }
 }
 ```
 
-```{r}
-
+```{r fit_inv_gamma_simu}
+fit <- stan(file = "sample_joint_ensemble3.stan", data = simu_data,
+            iter = R, warmup = 0, chains = 1, refresh = R,
+            seed = 4838282, algorithm = "Fixed_param")
+params <- rstan::extract(fit)
+simu_ys <- params$y
+plot_bin_quantiles(simu_ys, B = 70) +
+  geom_vline(xintercept = 25, color = "darkgrey")
 ```
 
+
+```{r}
+tryCatch({
+  registerDoParallel(cores = 4)
+  simu_list <- t(data.matrix(data.frame(simu_lambdas, simu_thetas, simu_ys)))
+  fit_model <- stan_model(file = "fit_data3.stan")
+  ensemble_output <- foreach(simu = simu_list, .combine = "cbind") %dopar% {
+    
+    simu_lambda <- simu[1]
+    simu_theta <- simu[2]
+    simu_y <- simu[3:(N + 2)]
+    input_data <- list("N" = N, "y" = simu_y)
+    capture.output(library(rstan))
+    capture.output(
+      fit <- sampling(fit_model, data = input_data, seed = 4938483)
+    )
+    util <- new.env()
+    source("stan_utility.R", local = util)
+    warning_code <- util$check_all_diagnostics(fit, quiet = TRUE)
+    sbc_rank_lambda <- sum(
+      simu_lambda < extract(fit)$lambda[seq(1, 4000 - 8, 8)]
+    )
+    sbc_rank_theta <- sum(simu_theta < extract(fit)$theta[seq(1, 4000 - 8, 8)])
+    s <- summary(fit, probs = c(), pars = "lambda")$summary
+    post_mean_lambda <- s[, 1]
+    post_sd_lambda <- s[, 3]
+    prior_sd_lambda <- sqrt((9.21604**2) / (3.48681 - 1)**3)
+    z_score_lambda <- (post_mean_lambda - simu_lambda) / post_sd_lambda
+    shrinkage_lambda <- 1 - (post_sd_lambda / prior_sd_lambda) ** 2
+
+    s <- summary(fit, probs = c(), pars = "theta")$summary
+    post_mean_theta <- s[, 1]
+    post_sd_theta <- s[, 3]
+    prior_sd_theta <- sqrt(2.8663**2 / (4 * 2.8663**2 * (2 * 2.8663 + 1))) 
+    z_score_theta <- (post_mean_theta - simu_theta) / post_sd_theta
+    shrinkage_theta <- 1 - (post_sd_theta / prior_sd_theta) ** 2
+    
+    c(warning_code, sbc_rank_lambda, z_score_lambda, shrinkage_lambda,
+      sbc_rank_theta, z_score_theta, shrinkage_theta)
+  }
+}, finally = {stopImplicitCluster()})
+```
