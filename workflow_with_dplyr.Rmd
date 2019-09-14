@@ -1,0 +1,357 @@
+---
+title: "Workflow using dplyr"
+author: "Giovanni d'Ario"
+date: "9/11/2019"
+output: html_document
+---
+
+```{r, echo=FALSE}
+### Tidyverse libraries
+library(magrittr)
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+```{r, echo=FALSE}
+### Parallel processing
+library(foreach)
+library(doParallel)
+
+### rstan and utilities
+library(rstan)
+rstan_options(auto_write = TRUE)
+
+source("stan_utility.R", local = util)
+util <- new.env()
+```
+
+## Colors
+
+```{r}
+### Define the colors
+c_light <- c("#DCBCBC")
+c_light_highlight <- c("#C79999")
+c_mid <- c("#B97C7C")
+c_mid_highlight <- c("#A25050")
+c_dark <- c("#8F2727")
+c_dark_highlight <- c("#7C0000")
+```
+
+We simulate 1000 draws from the 100 detectors.
+
+```{r}
+R <- 1000 # 1000 draws from the Bayesian joint distribution
+N <- 100
+
+simu_data <- list("N" = N)
+
+fit <- stan(file = 'sample_joint_ensemble.stan', data = simu_data,
+            iter = R, warmup = 0, chains = 1, refresh = R,
+            seed = 4838282, algorithm = "Fixed_param")
+```
+
+The `fit` object contains the simulated `lambda`s and `y`s.
+
+```{r}
+simu_params <- extract(fit)
+simu_lambdas <- simu_params$lambda
+simu_ys <- simu_params$y
+```
+
+We can visualize the distribution of the values of `lambda` in a histogram.
+
+```{r}
+df_simu_ys <- data.frame(simu_ys)
+colnames(df_simu_ys) <- paste0("D", 1:100)
+df_simu_ys$lambda <- simu_lambdas
+
+ggplot(df_simu_ys, aes(x = lambda)) + stat_bin(geom = "step")
+```
+
+This visualization, however, doesn't make things clearer. We can first bin the counts on each row, and then compute the quantiles for these counts.
+
+```{r}
+bin_and_count <- function(x, B, br) {
+  hist(x, breaks = br, plot = FALSE)$counts
+}
+
+plot_bin_quantiles <- function(simu_ys, 
+                               B=40, 
+                               br=0:(B + 1) - 0.5) {
+  pbs <- c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+  ## Compute the bin frequency for each row of simu_ys
+  bin_counts <- apply(simu_ys, 1, bin_and_count, B = B, br = br)
+  ## Compute the quantiles of each bin across the columns 
+  quants <- apply(bin_counts, 1, quantile, probs = pbs)
+  df_quants <- as_tibble(t(quants))
+  names(df_quants) <- paste("q", as.character(10 * pbs), sep = "_")
+  df_quants$x <- 0:40
+  ## Plot the bin quantiles
+  ggplot(df_quants, aes(x = x)) +
+    geom_ribbon(aes(ymin = q_1, ymax = q_9), fill = c_light) +
+    geom_ribbon(aes(ymin = q_2, ymax = q_8), fill = c_light_highlight) +
+    geom_ribbon(aes(ymin = q_3, ymax = q_7), fill = c_mid) + 
+    geom_ribbon(aes(ymin = q_4, ymax = q_6), fill = c_mid_highlight) +
+    geom_line(aes(y = q_5)) +
+    xlab("y") + ylab("") + 
+    ggtitle("Prior Predictive Distribution")
+}
+```
+
+We can then compute the quantiles of each bin across the 1000 runs. The black line represent the median.
+
+```{r}
+plot_bin_quantiles(simu_ys) + 
+  geom_vline(xintercept = 25, color = "darkgrey")
+```
+
+## Evaluate the simulated files
+
+In this section we want to generate multiple *posterior* distributions (in the previous section we were only examining the prior predictive distribution). Once we have these multiple posterior distributions, we can apply posterior-based calibration and compute the $z$ score and the posterior shrinkage. We can start defining a helper function which computes the Simulation Based Calibration Rank `sbc_rank`, the Z score `z_score`, the posterior shrinkage `shrinkage` and, in addition, captures any warning message produced by the diagnostic checks. Note that in the Case Study the rank is computed on a thinned `lambda` vector (one element every 8), while here we consider all the elements.
+
+```{r}
+compute_metrics <- function(simu, 
+                            N=N, 
+                            model, 
+                            thin=8, 
+                            prior_sd_lambda=5.82337, 
+                            seed=4938483) {
+  simu_lambda <- simu[1]
+  simu_y <- simu[-1]
+
+  input_data <- list("N" = N, "y" = simu_y)
+
+  capture.output(
+    fit <- sampling(model, data = input_data, seed = seed)
+  )
+
+  ## Check if there are problematic cases
+  util <- new.env()
+  warning_code <- util$check_all_diagnostics(fit, quiet = TRUE)
+
+  ## Simulation Based Calibration ranking
+  lambda <- extract(fit)$lambda
+  sbc_rank <- sum(simu_lambda < lambda[seq(1, length(lambda) - thin, thin)])
+
+  ## Compute posterior sensitivities
+  s <- summary(fit, probs = c(), pars = "lambda")$summary
+  post_mean_lambda <- s[, 1]
+  post_sd_lambda <- s[, 3]
+
+  z_score <- (post_mean_lambda - simu_lambda) / post_sd_lambda
+  shrinkage <- 1 - (post_sd_lambda / prior_sd_lambda)**2
+
+  c(warning_code, sbc_rank, z_score, shrinkage)
+}
+```
+
+We can run the above function in parallel on all the available cores.
+
+```{r}
+tryCatch({
+  ## Register doParallel
+  registerDoParallel(cores = detectCores())
+  
+  ## Create a data frame of simulated lambdas and ys
+  ## data.matrix converts a data frame into a matrix
+  simu_list <- t(data.matrix(data.frame(simu_lambdas, simu_ys)))
+
+  ## Fit the model that computes the posterior density (we need to do it once).
+  fit_model = stan_model(file = 'fit_data.stan')
+
+  ensemble_output <- foreach(simu = simu_list, .combine = "cbind") %dopar% {
+    compute_metrics(simu, N, fit_model)
+  }
+}, finally = {stopImplicitCluster()})
+```
+
+The result is a 4 x 1000 matrix with, in order, the number of warnings, the rank the z score, and the shrinkage.
+
+```{r}
+print(dim(ensemble_output))
+rownames(ensemble_output) <- c("num_warnings", "sbc_rank", "z_score", "shrinkage")
+output_df <- data.frame(t(ensemble_output))
+```
+
+We can first check whether we have any warning message.
+
+```{r}
+sum(ensemble_output[1, ])
+```
+
+We have zero warnings. This is good. We can then plot a histogram of the SBC ranks using the same `breaks` as in the case study.
+
+```{r}
+ggplot(output_df, aes(sbc_rank)) +
+  geom_histogram(color = c_dark_highlight, fill = c_dark,
+                 breaks = seq(0, 500, 25) - 0.5) +
+  xlab("Prior Rank") + ylab("")
+```
+
+Does it look like the histogram in the case study?
+
+```{r}
+sbc_hist <- hist(output_df$sbc_rank,
+                 seq(0, 500, 25) - 0.5,
+                 plot = FALSE)
+
+plot(sbc_hist, main = "Lambda", xlab = "Prior Rank", yaxt = 'n', ylab = "")
+
+low <- qbinom(0.005, R, 1 / 20)
+mid <- qbinom(0.5, R, 1 / 20)
+high <- qbinom(0.995, R, 1 / 20)
+bar_x <- c(-10, 510, 500, 510,-10, 0,-10)
+bar_y <- c(high, high, mid, low, low, mid, high)
+
+polygon(bar_x, bar_y, col = c("#DDDDDD"), border = NA)
+segments(x0 = 0, x1 = 500, y0 = mid, y1 = mid, col = c("#999999"), lwd = 2)
+
+plot(sbc_hist, col = c_dark, border = c_dark_highlight, add = TRUE)
+```
+
+Yes, it does.
+
+## Z scores and posterior shrinkage
+
+We can plot the `z_score` vs the `shrinkage` and see where our simulations fall.
+
+```{r}
+ggplot(output_df, aes(x = shrinkage, y = z_score)) +
+  geom_point(alpha = .1) +
+  xlim(0, 1) + ylim(-4, 4)
+```
+
+**TO UNDERSTAND** how do you explain the shrinkage from the prior to the posterior?
+
+## Fitting the observations an computing the posterior
+
+The dataset consistes of 100 observations, one per detector.
+
+```{r}
+input_data <- read_rdump("workflow.data.R")
+str(input_data)
+```
+
+We can then fit the observations with the following model
+
+```{stan, eval=FALSE}
+data {
+  int<lower=0> N;
+  int y[N];
+}
+
+parameters {
+  real<lower=0> lambda;
+}
+
+model {
+  lambda ~ normal(0, 5.82337);
+  y ~ poisson(lambda);
+}
+```
+
+```{r, message=FALSE}
+fit <- stan(file = 'fit_data_ppc.stan', data = input_data, seed = 4938483)
+```
+
+```{r}
+util$check_all_diagnostics(fit)
+params <- extract(fit)
+hist(params$lambda, main = "", xlab = "lambda", ylab = "",
+     col = c_dark, border = c_dark_highlight)
+```
+
+## Analysis of the posterior predictive distribution
+
+Running 4 chains has produced a 4000 x 100 matrix for `y_ppc`.
+
+```{r}
+p <- plot_bin_quantiles(params$y_ppc)
+p + stat_bin(data = tibble(y_obs = input_data$y), aes(y_obs),
+             breaks = 0:(41) - 0.5, geom = "step")
+```
+
+## Zero-inflated mode
+
+The sampling model is stored in `sample_join_ensemble2.stan` while the data fitting model is in `fit_data2.stan`.
+
+```{r}
+fit <- stan(file = "sample_joint_ensemble2.stan", data = simu_data,
+            iter = R, warmup = 0, chains = 1, refresh = R,
+            seed = 4838282, algorithm = "Fixed_param")
+
+params <- extract(fit)
+
+simu_list <- list(
+  "lambda" = params$lambda,
+  "theta" = params$theta,
+  "y" = params$y
+)
+```
+
+```{r}
+plot_bin_quantiles(simu_list$y) +
+  geom_vline(xintercept = 25, color = "darkgrey")
+```
+
+We can see the zero-enrichment in the prior predictive distribution, and the tails are unaltered.
+
+## Simulated fits
+
+```{r}
+compute_metrics2 <- function(simu, 
+                             N=N, 
+                             model, 
+                             parameters=c("lambda", "theta"),
+                             thin=8, 
+                             prior_sd_lambda=5.82337,
+                             prior_sd_theta=sqrt(1.0 / 12),
+                             seed=4938483) {
+  simu_lambda <- simu[1]
+  simu_theta <- simu[2]
+  simu_y <- simu[-c(1, 2)]
+
+  input_data <- list("N" = N, "y" = simu_y)
+
+  capture.output(
+    fit <- sampling(model, data = input_data, seed = seed)
+  )
+
+  ## Check if there are problematic cases
+  util <- new.env()
+  warning_code <- util$check_all_diagnostics(fit, quiet = TRUE)
+
+  ## Simulation Based Calibration ranking
+  lambda <- extract(fit)$lambda
+  theta <- extract(fit)$theta
+  
+  sbc_rank_lambda <- sum(
+    simu_lambda < lambda[seq(1, length(lambda) - thin, thin)]
+  )
+  sbc_rank_theta <- sum(simu_theta < theta[seq(1, length(theta) - thin, thin)])
+
+  s <- summary(fit, probs = c(), pars = "lambda")$summary
+  post_mean_lambda <- s[, 1]
+  post_sd_lambda <- s[, 3]
+  z_score_lambda <- (post_mean_lambda - simu_lambda) / post_sd_lambda
+  shrinkage_theta <- 1 - (post_sd_lambda / prior_sd_lambda)**2
+
+  s <- summary(fit, probs = c(), pars = "theta")$summary
+  post_mean_theta <- s[, 1]
+  post_sd_theta <- s[, 3]
+  z_score_theta <- (post_mean_theta - simu_theta) / post_sd_theta
+  shrinkage_theta <- 1 - (post_sd_theta / prior_sd_theta)**2
+  
+  c(warning_code,
+    sbc_rank_lambda, z_score_lambda, shrinkage_lambda,
+    sbc_rank_theta, z_score_theta, shrinkage_theta
+  )
+}
+```
+
+```{r}
+
+```
+

@@ -1,2 +1,3 @@
 # stan_notes
-Notes on Stan and some attempts to recreate the use cases using ggplot2 and the tidyverse.
+
+This repository contains some sparse notes on Stan and tries to re-create some of Stan's use cases using `ggplot2` and `tydiverse`.
