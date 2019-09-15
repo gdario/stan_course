@@ -1,7 +1,7 @@
 ---
-title: "Workflow using dplyr"
+title: "A deep dive into the Principled Workflow (using dplyr)"
 author: "Giovanni d'Ario"
-date: "9/11/2019"
+date: "9/15/2019"
 output: html_document
 ---
 
@@ -27,7 +27,20 @@ source("stan_utility.R", local = util)
 source("utils.R")
 ```
 
-We simulate 1000 draws from the 100 detectors.
+# Introduction
+
+In this document we try to break down the pattern described in the case study titled "Towards A Principled Bayesian Workflow". This pattern is repeated throughout the document, but the verbosity of the code can make it difficult to clearly identify the individual steps.
+
+In this case study we assume that we are modeling measurements from an array of 100 detectors that are measuring the same source. We initially assume that the 100 detectors are identical. The workflow moves through 4 key steps:
+
+1. Check the consistency of the prior predictive distribution with our domain knowledge.
+2. Check computational faithfulness by plotting the Simulation Based Calibration histograms of the various parameters.
+3. Check the model sensitivity by plotting the posterior z scores and the posterior shrinkage.
+4. Check model adequacy by comparing our posterior predictive probability with the observations.
+
+# Step 1: Domain Expertise Consistency
+
+In model `sample_joint_ensemble.stan` we sample `lambda` from the prior, a Normal distribution with parameters $\mu = 0$ and $\sigma = 5.82337$, and we generate N  `y`s from a Poisson distribution with intensity `lambda`. We can generate these values in two ways. In the first case, we just fit the model and we obtain the values as parameters.
 
 ```{r}
 R <- 1000 # 1000 draws from the Bayesian joint distribution
@@ -35,15 +48,25 @@ N <- 100
 
 simu_data <- list("N" = N)
 
-fit <- stan(file = 'sample_joint_ensemble.stan', data = simu_data,
+fit1 <- stan(file = 'sample_joint_ensemble.stan', data = simu_data,
             iter = R, warmup = 0, chains = 1, refresh = R,
             seed = 4838282, algorithm = "Fixed_param")
 ```
 
-The `fit` object contains the simulated `lambda`s and `y`s.
+An alternative is to compile the model without actually fitting it, and running the `sampling` function from the `rstan` package to obtain the samples.
+
+```{r using_sampling}
+fit_model <- stan_model(file = "sample_joint_ensemble.stan")
+
+fit2 <- sampling(fit_model, data = simu_data,
+                 iter = R, warmup = 0, chains = 1, refresh = R,
+                 seed = 4838282, algorithm = "Fixed_param")
+```
+
+This second form seems to offer some flexibility. No matter which fit we select, it contains simulated `lambda`s and `y`s.
 
 ```{r}
-simu_params <- extract(fit)
+simu_params <- extract(fit1)
 ```
 
 We can visualize the distribution of the values of `lambda` in a histogram.
@@ -56,72 +79,48 @@ df_simu_ys$lambda <- simu_params$lambda
 ggplot(df_simu_ys, aes(x = lambda)) + stat_bin(geom = "step")
 ```
 
-This visualization, however, doesn't make things clearer. We can first bin the counts on each row, and then compute the quantiles for these counts.
-We can then compute the quantiles of each bin across the 1000 runs. The black line represent the median.
+This visualization, however, doesn't provide much of an insight into the model. Following the case study, we take the $1000 \times 100$ matrix containing the 1000 runs of our simulation and
+
+1. For each *row* $r = 1,\ldots, 1000$ we bin the counts into a number of buckets $B$, thus obtaining a matrix $1000 \times B$.
+2. For each *column*, i.e, each bin, we compute the deciles across the 1000 runs.
+3. We plot the quantiles showing the median as a black line.
+
+The `plot_bin_quantiles` function takes a matrix of `y`s and generates such plot. The gray line at $y = 25$ shows what, in the case study, is considered an extreme observation.
 
 ```{r}
+print(dim(simu_params$y))
+      
 plot_bin_quantiles(simu_params$y) + 
   geom_vline(xintercept = 25, color = "darkgrey")
 ```
 
 ## Evaluate the simulated files
 
-In this section we want to generate multiple *posterior* distributions (in the previous section we were only examining the prior predictive distribution). Once we have these multiple posterior distributions, we can apply posterior-based calibration and compute the $z$ score and the posterior shrinkage. We can start defining a helper function which computes the Simulation Based Calibration Rank `sbc_rank`, the Z score `z_score`, the posterior shrinkage `shrinkage` and, in addition, captures any warning message produced by the diagnostic checks. Note that in the Case Study the rank is computed on a thinned `lambda` vector (one element every 8), while here we consider all the elements.
+The output of the previous fit was a list of simulated parameters, `simu_params`. For the next step we want to rearrange this list into a matrix in order to take advantage of parallel computing by using the libraries `doParallel` and `foreach`.
 
-```{r, eval=FALSE}
-compute_metrics <- function(simu, 
-                            N=N, 
-                            model, 
-                            thin=8, 
-                            prior_sd_lambda=5.82337, 
-                            seed=4938483) {
-  simu_lambda <- simu[1]
-  simu_y <- simu[-1]
+The `simu_params` list contains three elements: `lambda`, `y` and `lp__`. The last element has to do with the log posterior, and we don't need it for our simulations. The utility function `create_simulation_matrix` removes such element and turns the list into a matrix. This matrix has 101 rows and 1000 columns. Each column corresponds to a run. The first row contains the simulated values for `lambda` while the remaining 100 contain the simulated values for the 100 values of `y`. We will be running 4 parallel processes, each of which does the following (most of these steps are performed by the `create_simulation_matrix` function):
 
-  input_data <- list("N" = N, "y" = simu_y)
-
-  capture.output(
-    fit <- sampling(model, data = input_data, seed = seed)
-  )
-
-  ## Check if there are problematic cases
-  util <- new.env()
-  source("stan_utility.R", local = util)
-  warning_code <- util$check_all_diagnostics(fit, quiet = TRUE)
-
-  ## Simulation Based Calibration ranking
-  lambda <- extract(fit)$lambda
-  sbc_rank <- sum(simu_lambda < lambda[seq(1, length(lambda) - thin, thin)])
-
-  ## Compute posterior sensitivities
-  s <- summary(fit, probs = c(), pars = "lambda")$summary
-  post_mean_lambda <- s[, 1]
-  post_sd_lambda <- s[, 3]
-
-  z_score <- (post_mean_lambda - simu_lambda) / post_sd_lambda
-  shrinkage <- 1 - (post_sd_lambda / prior_sd_lambda)**2
-
-  c(warning_code, sbc_rank, z_score, shrinkage)
-}
-```
-
-We can run the above function in parallel on all the available cores.
+1. Take a row of the matrix created by `create_simulation_matrix`. The first element of each row is the simulated value of `lambda`, while the remaining are the 100 values of `y`.
+2. Create an `input_data` object containing the number of sensors $N$ and the 100 simulated `y`. These data will be then fed to a model `fit_model` based on a `fit_data.stan` file in order to compute the posteriors.
+3. The model is fitted outside the `foreach` loop. Each parallel job samples from this model and returns the parameters for which we can estimate the posterior mean and standard deviation. During the sampling process, we also accumulate the diagnostic checks.
+4. We compute the SBC ranks by means of the `get_sbc_ranks` function. This makes use of the simulated value of the parameter (the first row of our matrix) and of the posterior estimates we have just sampled. There is also a thinning parameter.
+5. We compute the summary of the fitted parameters and compute the posterior mean and standard deviation. These are then used to compute the z-scores and the shrinkage.
+6. To compute the shrinkage we also need the prior standard deviation. This must be passed explicitly by the user as an argument to `get_sbc_parameters`.
+7. Finally, the `get_sbc_parmaeters` returns the warning codes, the SBC ranks, the z scores and the posterior shrinkage.
 
 ```{r}
 tryCatch({
   ## Register doParallel
-  registerDoParallel(cores = detectCores())
+  registerDoParallel(cores = 4)
   
   ## Create a data frame of simulated lambdas and ys
   ## data.matrix converts a data frame into a matrix
-  simu_list <- t(data.matrix(data.frame(
-    remove_lp__(simu_params)))
-  )
+  simu_matrix <- create_simulation_matrix(simu_params)
 
   ## Fit the model that computes the posterior density (we need to do it once).
   fit_model = stan_model(file = 'fit_data.stan')
 
-  ensemble_output <- foreach(simu = simu_list, .combine = "cbind") %dopar% {
+  ensemble_output <- foreach(simu = simu_matrix, .combine = "cbind") %dopar% {
     get_sbc_parameters(sim_vector = simu,
                        model = fit_model,
                        param_names = "lambda",
@@ -132,11 +131,12 @@ tryCatch({
 }, finally = {stopImplicitCluster()})
 ```
 
-The result is a 4 x 1000 matrix with, in order, the number of warnings, the rank the z score, and the shrinkage.
+The result is a 4 x 1000 matrix where the rows represent, in order, the number of warnings, the rank the z score, and the shrinkage for each of the $R$ runs.
 
 ```{r}
 print(dim(ensemble_output))
-rownames(ensemble_output) <- c("num_warnings", "sbc_rank", "z_score", "shrinkage")
+rownames(ensemble_output) <- c("num_warnings", "sbc_rank", "z_score",
+                               "shrinkage")
 output_df <- data.frame(t(ensemble_output))
 ```
 
@@ -265,13 +265,11 @@ prior_sd_lambda <- sqrt((9.21604)**2 / ((3.4681 - 1)**3))
   
 tryCatch({
   ## Register doParallel
-  registerDoParallel(cores = detectCores())
+  registerDoParallel(cores = 4)
   
   ## Create a data frame of simulated lambdas and ys
   ## data.matrix converts a data frame into a matrix
-  simu_list <- t(data.matrix(data.frame(
-    remove_lp__(simu_params)))
-  )
+  simu_list <- create_simulation_matrix(simu_params)
 
   ## Fit the model that computes the posterior density (we need to do it once).
   fit_model = stan_model(file = 'fit_data2.stan')
@@ -287,7 +285,6 @@ tryCatch({
 }, finally = {stopImplicitCluster()})
 ```
 
-
 Do we have warning codes? Yes we do:
 
 ```{r}
@@ -302,8 +299,8 @@ for (r in 1:R) {
   if (warning_code[r] != 0) {
     print(sprintf("Replication %s of %s", r, R))
     util$parse_warning_code(warning_code[r])
-    print(sprintf("Simulated lambda = %s", simu_lambdas[r]))
-    print(sprintf("Simulated theta = %s", simu_thetas[r]))
+    print(sprintf("Simulated lambda = %s", simu_params$lambda[r]))
+    print(sprintf("Simulated theta = %s", simu_params$theta[r]))
     print(" ")
   }
 }
@@ -325,13 +322,11 @@ prior_sd_lambda <- sqrt((9.21604**2) / (3.48681 - 1)**3)
 
 tryCatch({
   ## Register doParallel
-  registerDoParallel(cores = detectCores())
+  registerDoParallel(cores = 4)
   
   ## Create a data frame of simulated lambdas and ys
   ## data.matrix converts a data frame into a matrix
-  simu_list <- t(data.matrix(data.frame(
-    remove_lp__(simu_params)))
-  )
+  simu_list <- create_simulation_matrix(simu_params)
 
   ## Fit the model that computes the posterior density (we need to do it once).
   fit_model = stan_model(file = 'fit_data3.stan')
@@ -345,42 +340,4 @@ tryCatch({
                        N = N)
   }
 }, finally = {stopImplicitCluster()})
-# 
-# tryCatch({
-#   registerDoParallel(cores = 4)
-#   simu_list <- t(data.matrix(data.frame(simu_lambdas, simu_thetas, simu_ys)))
-#   fit_model <- stan_model(file = "fit_data3.stan")
-#   ensemble_output <- foreach(simu = simu_list, .combine = "cbind") %dopar% {
-#     
-#     simu_lambda <- simu[1]
-#     simu_theta <- simu[2]
-#     simu_y <- simu[3:(N + 2)]
-#     input_data <- list("N" = N, "y" = simu_y)
-#     capture.output(library(rstan))
-#     capture.output(
-#       fit <- sampling(fit_model, data = input_data, seed = 4938483)
-#     )
-#     util <- new.env()
-#     source("stan_utility.R", local = util)
-#     warning_code <- util$check_all_diagnostics(fit, quiet = TRUE)
-#     sbc_rank_lambda <- sum(
-#       simu_lambda < extract(fit)$lambda[seq(1, 4000 - 8, 8)]
-#     )
-#     sbc_rank_theta <- sum(simu_theta < extract(fit)$theta[seq(1, 4000 - 8, 8)])
-#     s <- summary(fit, probs = c(), pars = "lambda")$summary
-#     post_mean_lambda <- s[, 1]
-#     post_sd_lambda <- s[, 3]
-#     z_score_lambda <- (post_mean_lambda - simu_lambda) / post_sd_lambda
-#     shrinkage_lambda <- 1 - (post_sd_lambda / prior_sd_lambda) ** 2
-# 
-#     s <- summary(fit, probs = c(), pars = "theta")$summary
-#     post_mean_theta <- s[, 1]
-#     post_sd_theta <- s[, 3]
-#     z_score_theta <- (post_mean_theta - simu_theta) / post_sd_theta
-#     shrinkage_theta <- 1 - (post_sd_theta / prior_sd_theta) ** 2
-#     
-#     c(warning_code, sbc_rank_lambda, z_score_lambda, shrinkage_lambda,
-#       sbc_rank_theta, z_score_theta, shrinkage_theta)
-#   }
-# }, finally = {stopImplicitCluster()})
 ```
