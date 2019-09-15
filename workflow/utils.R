@@ -66,14 +66,39 @@ plot_bin_quantiles <- function(simu_ys,
     ggtitle("Prior Predictive Distribution")
 }
 
+##' Create a data matrix starting from a list of parameters
+##'
+##' This function creates a data matrix by first removing the traiilng
+##' \code{lp__} element from a parameter list and then turning the remaining
+##' elements into a data matrix.
+##' @title 
+##' @param params 
+##' @return A data matrix.
 create_simulation_matrix <- function(params) {
-  t(data.matrix(data.frame(params[-length(params)])))
+  params <- remove_lp__(params)
+  t(data.matrix(data.frame(params)))
 }
 
+##' Compute the SBC rank of a simulated parameter
+##'
+##' This function computes the SBC rank as described in the "Principled
+##' Workflow" case study.
+##' @param sim_param Simulated parameter.
+##' @param param The vector of parameters to test against.
+##' @param thin Integer: the thinning parameter.
+##' @return 
 get_sbc_rank <- function(sim_param, param, thin) {
   sum(sim_param < param[seq(1, length(param) - thin, thin)])
 }
 
+##' Compute the posterior z-score
+##'
+##' Given a posterior mean, a posterior standard deviation and a simulated
+##' value, this function computes the posterior z-score for that value.
+##' @param post_mean Posterior mean
+##' @param simul Simulated parameter
+##' @param post_sd Posterior standard deviation
+##' @return A real number representing the posterior z-score.
 get_z_score <- function(post_mean, simul, post_sd) {
   (post_mean - simul) / post_sd
 }
@@ -95,9 +120,9 @@ get_sbc_parameters <- function(sim_vector,
   stopifnot(!is.null(prior_sd))
   n_params <- length(param_names)
   stopifnot(length(prior_sd) == n_params)
-  # ## Make sure that the parameters appear in the correct order in sim_vector
-  # if (!identical(param_names, names(sim_vector)[seq_len(n_params)]))
-  #   stop("The parameter names are not matching with those in `sim_vector`")
+  ## Make sure that the parameters appear in the correct order in sim_vector
+  if (!identical(param_names, rownames(sim_vector)[seq_len(n_params)]))
+    stop("The parameter names are not matching with those in `sim_vector`")
 
   ## The simulated ys come after the n_params parameters
   sim_params <- sim_vector[seq_len(n_params)]
