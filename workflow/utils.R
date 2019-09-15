@@ -29,7 +29,7 @@ remove_lp__ <- function(x) {
 ##' @param br Numeric. A vector of bin breaks.
 ##' @return A vector of bin counts.
 ##' @author Giovanni d'Ario
-bin_and_count <- function(x, B, br) {
+bin_and_count <- function(x, br) {
   hist(x, breaks = br, plot = FALSE)$counts
 }
 
@@ -44,17 +44,17 @@ bin_and_count <- function(x, B, br) {
 ##' @return No return value. A plot is produced as a side effect.
 ##' @author Giovanni d'Ario
 plot_bin_quantiles <- function(simu_ys,
-                               B=max(simu_ys),
-                               br=0:(B + 1) - 0.5) {
+                               B=round(range(simu_ys)),
+                               br=(B[1] - 0.5):(B[2] + 0.5)) {
   ## Vector of quantiles
   pbs <- c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
   ## Compute the bin frequency for each row of simu_ys
-  bin_counts <- apply(simu_ys, 1, bin_and_count, B = B, br = br)
+  bin_counts <- apply(simu_ys, 1, bin_and_count, br = br)
   ## Compute the quantiles of each bin across the columns
   quants <- apply(bin_counts, 1, quantile, probs = pbs)
   df_quants <- as_tibble(t(quants))
   names(df_quants) <- paste("q", as.character(10 * pbs), sep = "_")
-  df_quants$x <- 0:B
+  df_quants$x <- B[1]:B[2]
   ## Plot the bin quantiles
   ggplot(df_quants, aes(x = x)) +
     geom_ribbon(aes(ymin = q_1, ymax = q_9), fill = c_light) +
